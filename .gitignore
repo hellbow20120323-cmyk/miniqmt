@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 行情/回测数据（体积大）
+history_*.csv
+sweep_results_*.csv
+
+# 运行时生成
+shared_quote.json
+order_signal.json
+backtest_*.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
