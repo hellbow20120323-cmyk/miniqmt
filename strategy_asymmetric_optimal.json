@@ -1,0 +1,11 @@
+{
+  "name": "跌少涨多最优",
+  "description": "涨跌比例扫描综合最优：买入步长系数1.0(对称)、止盈系数1.8(涨多)，占用年化47.25%，回撤-6.23%",
+  "BUY_STEP_FACTOR": 1.0,
+  "SELL_THRESHOLD_FACTOR": 1.8,
+  "MAX_LAYERS": 9,
+  "LAYER_WEIGHTS": [1, 1, 1, 1, 1, 1, 1, 1, 1],
+  "SELL_PROFIT_THRESHOLD": 0.005,
+  "SELL_BY_LOT": true,
+  "ENABLE_FLOAT_LOSS_STOP": false
+}

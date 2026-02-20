@@ -13,6 +13,8 @@ sweep_results_*.csv
 # 运行时生成
 shared_quote.json
 order_signal.json
+dashboard_state.json
+*.tmp
 backtest_*.png
 
 # IDE

@@ -1,0 +1,13 @@
+{
+  "name": "9层最优解",
+  "description": "层数扫描综合最优：9层均权，单笔止盈0.5%，关浮亏止损，得分=占用年化%+0.3×回撤%",
+  "MAX_LAYERS": 9,
+  "LAYER_WEIGHTS": [1, 1, 1, 1, 1, 1, 1, 1, 1],
+  "SELL_PROFIT_THRESHOLD": 0.005,
+  "SELL_BY_LOT": true,
+  "ENABLE_FLOAT_LOSS_STOP": false,
+  "ATR_GRID_FACTOR": 0.28,
+  "GRID_STEP_FLOOR": 0.0008,
+  "BATCH_MONEY": 200000,
+  "BETA_CAPITAL": 300000
+}

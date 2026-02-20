@@ -1,0 +1,6 @@
+# miniqmt Mac 回测与看板依赖
+# xtquant 为 Windows 迅雷 QMT 专用，Mac 仅需以下包
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+rich>=13.0
