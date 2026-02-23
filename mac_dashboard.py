@@ -5,6 +5,7 @@
 import json
 import time
 import os
+import uuid
 import pandas as pd
 import numpy as np
 from rich.console import Console
@@ -13,11 +14,22 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.layout import Layout
 
-# --- 路径：相对本脚本所在目录 ---
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# --- 路径：相对本脚本所在目录；离线测试时可设环境变量 DASHBOARD_WORK_DIR 指向 test_offline ---
+_SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
 SHARED_FILE = os.path.join(_SCRIPT_DIR, 'shared_quote.json')
+SHARED_POOL_FILE = os.path.join(_SCRIPT_DIR, 'shared_pool.json')  # 双标共享资金池，见 开发文档_双标的共享资金池.md
 SIGNAL_FILE = os.path.join(_SCRIPT_DIR, 'order_signal.json')
+ORDER_RESULT_FILE = os.path.join(_SCRIPT_DIR, 'order_result.json')
 STATE_FILE = os.path.join(_SCRIPT_DIR, 'dashboard_state.json')
+
+# 物理池与迟滞（与 global_vault / 开发文档一致）
+PHYSICAL_POOL = 300_000
+POOL_90_PCT = 270_000   # 占用 > 90% 触发步长惩罚
+POOL_85_PCT = 255_000   # 占用 < 85% 解除惩罚；>85% 禁止新开第一层
+_step_penalty_active = False
+
+# --- 部分成交：单边下跌补买 15 分钟超时，单边上涨只对齐不补卖 ---
+PENDING_BUY_TIMEOUT_SEC = 900
 
 # --- 标的 ---
 STOCK_CODE = '159201.SZ'
@@ -54,6 +66,13 @@ DATA_STALE_SECONDS = 300          # 行情超过 5 分钟未更新则不再发�
 STATE_TMP = STATE_FILE + ".tmp"
 SIGNAL_TMP = SIGNAL_FILE + ".tmp"
 
+# --- 静默期（仅内存）：发信号后锁定该层/该笔，直到真实持仓更新或超时，避免延迟期内重复发单 ---
+PENDING_TIMEOUT_SEC = 120
+pending_until_layers = None
+pending_since = None
+pending_sell_since = None
+pending_sell_volume = 0
+
 def _load_state():
     default = {
         "last_buy_price": None,
@@ -62,6 +81,17 @@ def _load_state():
         "hold_t0_volume": 0,
         "last_sell_timestamp": None,
         "positions": [],
+        "last_sent_signal_id": None,
+        "last_sent_signal_direction": None,
+        "last_sent_signal_shares": None,
+        "last_sent_signal_price": None,
+        "last_sent_buy_prev_anchor": None,
+        "last_sent_sell_removed_lots": [],
+        "last_sent_was_topup": False,
+        "last_applied_result_signal_id": None,
+        "pending_buy_shares": 0,
+        "pending_buy_price": None,
+        "pending_buy_since": None,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -98,6 +128,17 @@ def _save_state(s):
             "hold_t0_volume": s.get("hold_t0_volume", 0),
             "last_sell_timestamp": s.get("last_sell_timestamp"),
             "positions": s.get("positions", []),
+            "last_sent_signal_id": s.get("last_sent_signal_id"),
+            "last_sent_signal_direction": s.get("last_sent_signal_direction"),
+            "last_sent_signal_shares": s.get("last_sent_signal_shares"),
+            "last_sent_signal_price": s.get("last_sent_signal_price"),
+            "last_sent_buy_prev_anchor": s.get("last_sent_buy_prev_anchor"),
+            "last_sent_sell_removed_lots": s.get("last_sent_sell_removed_lots", []),
+            "last_sent_was_topup": s.get("last_sent_was_topup", False),
+            "last_applied_result_signal_id": s.get("last_applied_result_signal_id"),
+            "pending_buy_shares": s.get("pending_buy_shares", 0) or 0,
+            "pending_buy_price": s.get("pending_buy_price"),
+            "pending_buy_since": s.get("pending_buy_since"),
         }
         with open(STATE_TMP, 'w') as f:
             json.dump(persist, f, indent=2)
@@ -116,6 +157,33 @@ def _write_signal_atomic(signal_data):
         os.replace(SIGNAL_TMP, SIGNAL_FILE)
     except Exception:
         pass
+
+
+def _load_shared_pool():
+    """读取 shared_pool.json，返回 committed 总额与各标的 used/frozen/acc_alpha；无文件或异常返回空结构。"""
+    out = {
+        "used_159201": 0.0, "used_512890": 0.0,
+        "frozen_159201": 0.0, "frozen_512890": 0.0,
+        "committed": 0.0,
+        "acc_alpha_159201": 0.0, "acc_alpha_512890": 0.0,
+        "updated_at": None,
+    }
+    if not os.path.exists(SHARED_POOL_FILE):
+        return out
+    try:
+        with open(SHARED_POOL_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for k in out:
+            if k in data and data[k] is not None:
+                if k == "updated_at":
+                    out[k] = data[k]
+                else:
+                    out[k] = float(data[k])
+        out["committed"] = out["used_159201"] + out["used_512890"] + out["frozen_159201"] + out["frozen_512890"]
+    except Exception:
+        pass
+    return out
+
 
 state = _load_state()
 state["signals"] = state.get("signals", [])
@@ -215,8 +283,8 @@ def calculate_atr_and_trend(df):
         "pause_buy": pause_buy,
     }
 
-# --- 信号输出：先持久化状态再写信号（避免崩溃后重复发单）；原子写入信号文件 ---
-def execute_signal(direction, price, reason, shares=None):
+# --- 信号输出：先持久化状态再写信号（避免崩溃后重复发单）；原子写入信号文件；双标时带 client_order_id/amount/layer_index ---
+def execute_signal(direction, price, reason, shares=None, is_topup=False, amount=None, layer_index=None):
     msg = f"检测到{direction}信号 | 价格:{price:.3f} | 原因:{reason}"
     state["signals"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
     if len(state["signals"]) > 8:
@@ -225,14 +293,126 @@ def execute_signal(direction, price, reason, shares=None):
     voice_msg = "买入159201" if direction == "BUY" else "卖出159201"
     os.system(f'say "{voice_msg}" &')
 
+    # 可读唯一标识：BUY_159201.SZ_L1_abc12def / SELL_159201.SZ_abc12def
+    short_id = uuid.uuid4().hex[:8]
+    if direction == "BUY":
+        layer = state.get("hold_layers", 0)
+        signal_id = f"BUY_{STOCK_CODE}_L{layer}_{short_id}"
+    else:
+        signal_id = f"SELL_{STOCK_CODE}_{short_id}"
+
+    # 双标共享资金池：Executor 与 GlobalVault 需要 client_order_id / amount / layer_index
+    if amount is None and direction == "BUY" and shares and price:
+        amount = round(price * shares, 2)
+    if layer_index is None and direction == "BUY":
+        layer_index = state.get("hold_layers", 0)
+
     signal_data = {
+        "signal_id": signal_id,
+        "client_order_id": signal_id,
         "code": STOCK_CODE,
         "direction": direction,
         "price": price,
         "shares": shares,
         "timestamp": time.time(),
+        "reason": reason,
     }
+    if amount is not None:
+        signal_data["amount"] = amount
+    if layer_index is not None:
+        signal_data["layer_index"] = int(layer_index)
+    state["last_sent_signal_id"] = signal_data["signal_id"]
+    state["last_sent_signal_direction"] = direction
+    state["last_sent_signal_shares"] = shares
+    state["last_sent_signal_price"] = price
+    state["last_sent_was_topup"] = is_topup
     _write_signal_atomic(signal_data)
+    _save_state(state)
+
+
+def _apply_order_result(result):
+    """根据 order_result 做部分成交对齐：跌时改仓位+设补单，涨时把未卖部分写回 positions。"""
+    if not isinstance(result, dict):
+        return
+    sid = result.get("signal_id")
+    if not sid or sid != state.get("last_sent_signal_id") or sid == state.get("last_applied_result_signal_id"):
+        return
+    requested = int(result.get("requested_shares") or 0)
+    filled = int(result.get("filled_shares", requested) or requested)
+    direction = (result.get("direction") or "").upper()
+    price = float(result.get("price") or result.get("last_sent_signal_price") or 0)
+    if price <= 0:
+        price = state.get("last_sent_signal_price") or 0
+
+    state["last_applied_result_signal_id"] = sid
+
+    if filled >= requested:
+        _save_state(state)
+        return
+
+    if direction == "BUY":
+        is_topup = state.get("last_sent_was_topup", False)
+        positions = list(state.get("positions", []))
+        if is_topup:
+            if filled > 0:
+                positions.append({"shares": filled, "cost": filled * price, "buy_price": price})
+            remaining = requested - filled
+            if remaining > 0:
+                state["pending_buy_shares"] = remaining
+                state["pending_buy_price"] = price
+                state["pending_buy_since"] = time.time()
+            else:
+                state["pending_buy_shares"] = 0
+                state["pending_buy_price"] = None
+                state["pending_buy_since"] = None
+        else:
+            if not positions:
+                state["last_buy_price"] = state.get("last_sent_buy_prev_anchor") or state.get("last_buy_price")
+            else:
+                if filled > 0:
+                    positions[-1] = {"shares": filled, "cost": filled * price, "buy_price": price}
+                else:
+                    positions.pop()
+                    state["last_buy_price"] = state.get("last_sent_buy_prev_anchor") or state.get("last_buy_price")
+                remaining = requested - filled
+                if remaining > 0:
+                    state["pending_buy_shares"] = remaining
+                    state["pending_buy_price"] = price
+                    state["pending_buy_since"] = time.time()
+                else:
+                    state["pending_buy_shares"] = 0
+                    state["pending_buy_price"] = None
+                    state["pending_buy_since"] = None
+
+        state["positions"] = positions
+        state["hold_layers"] = len(positions)
+        state["hold_t0_volume"] = sum(p["shares"] for p in positions)
+        state["total_cost"] = sum(p["cost"] for p in positions)
+
+    elif direction == "SELL":
+        removed = state.get("last_sent_sell_removed_lots", [])
+        if not removed:
+            _save_state(state)
+            return
+        total_removed = sum(lot["shares"] for lot in removed)
+        total_cost_removed = sum(lot["cost"] for lot in removed)
+        remaining = requested - filled
+        if remaining <= 0:
+            _save_state(state)
+            return
+        avg_price = total_cost_removed / total_removed if total_removed else price
+        back_cost = total_cost_removed * (remaining / total_removed) if total_removed else remaining * price
+        positions = state.get("positions", [])
+        positions.append({"shares": remaining, "cost": back_cost, "buy_price": avg_price})
+        state["positions"] = positions
+        state["hold_layers"] = len(positions)
+        state["hold_t0_volume"] = sum(p["shares"] for p in positions)
+        state["total_cost"] = sum(p["cost"] for p in positions)
+        state["pending_sell_since"] = None
+        state["pending_sell_volume"] = 0
+
+    _save_state(state)
+
 
 # --- 仪表盘布局 ---
 def make_layout():
@@ -265,6 +445,13 @@ def generate_display(data, atr_info, last_buy_price, hold_layers, total_cost, ho
         table.add_row("单笔止盈", f"≥买入价×{1+sell_eff:.4f}", "每笔达则卖该笔")
         table.add_row("T+0 层数 / 持仓", f"{hold_layers} 层 / {hold_t0_volume} 股", f"成本 {total_cost:,.0f}")
         table.add_row("真实持仓(桥)", f"{pos.get('volume', 0)} 股", f"可用: {pos.get('can_use_volume', 0)}")
+        # 双标共享池：占用与两路 Alpha
+        if "pool_committed" in atr_info:
+            c = atr_info["pool_committed"]
+            pct = (c / PHYSICAL_POOL * 100) if PHYSICAL_POOL else 0
+            penalty = "步长×1.5" if atr_info.get("pool_penalty") else "正常"
+            table.add_row("共享池占用", f"{c:,.0f} ({pct:.1f}%)", penalty)
+            table.add_row("Alpha 159201 / 512890", f"{atr_info.get('pool_acc_alpha_159201', 0):.2f} / {atr_info.get('pool_acc_alpha_512890', 0):.2f}", "两路累计")
     else:
         table.add_row("当前价格", f"{curr_p:.3f}", f"🕒 {data.get('time', '')}" if data else "—")
         table.add_row("指标", "—", "需至少约 65 根 K 线才能计算 ATR/趋势")
@@ -275,7 +462,7 @@ def generate_display(data, atr_info, last_buy_price, hold_layers, total_cost, ho
 
 # --- 主循环：读行情 → 算 ATR/趋势 → 与回测一致的买卖逻辑 → 更新状态与 UI ---
 def main():
-    global state
+    global state, pending_until_layers, pending_since, pending_sell_since, pending_sell_volume
     layout = make_layout()
     with Live(layout, refresh_per_second=1, screen=True) as live:
         while True:
@@ -330,8 +517,51 @@ def main():
                     state["hold_t0_volume"] = hold_t0_volume
                     state["total_cost"] = total_cost
 
+                    # 部分成交：读 order_result 做状态对齐（跌：改仓位+设补单；涨：未卖部分写回 positions）
+                    if os.path.exists(ORDER_RESULT_FILE):
+                        try:
+                            with open(ORDER_RESULT_FILE, 'r') as f:
+                                _apply_order_result(json.load(f))
+                        except Exception:
+                            pass
+                    if pending_sell_since is None and (state.get("pending_sell_since") is not None or state.get("pending_sell_volume")):
+                        pending_sell_since = state.get("pending_sell_since")
+                        pending_sell_volume = state.get("pending_sell_volume") or 0
+                    elif state.get("pending_sell_since") is None:
+                        pending_sell_since = None
+                        pending_sell_volume = 0
+
+                    # 从 state 刷新（apply 可能已改 positions）
+                    positions = state.get("positions", [])
+                    hold_layers = len(positions)
+                    hold_t0_volume = sum(p["shares"] for p in positions)
+                    total_cost = sum(p["cost"] for p in positions)
+
+                    # 补单超时放弃（15 分钟）
+                    if state.get("pending_buy_shares") and state.get("pending_buy_since"):
+                        if (time.time() - state["pending_buy_since"]) > PENDING_BUY_TIMEOUT_SEC:
+                            state["pending_buy_shares"] = 0
+                            state["pending_buy_price"] = None
+                            state["pending_buy_since"] = None
+                            _save_state(state)
+
                     # 与真实持仓同步：若桥显示 0 持仓而本地认为有仓，说明已在外盘平仓/重启后不一致，以真实为准避免重复卖
                     real_volume = (data.get("position") or {}).get("volume", 0) or 0
+                    curr_p_for_layers = curr_p if curr_p and curr_p > 0 else 0
+                    real_layers = int(real_volume * curr_p_for_layers / PART_MONEY) if curr_p_for_layers > 0 else 0
+
+                    # 静默期解除：真实持仓已跟上或超时则清除
+                    if pending_until_layers is not None and (
+                        real_layers >= pending_until_layers or (time.time() - (pending_since or 0)) > PENDING_TIMEOUT_SEC
+                    ):
+                        pending_until_layers = None
+                        pending_since = None
+                    if pending_sell_since is not None and (
+                        real_volume < pending_sell_volume or (time.time() - pending_sell_since) > PENDING_TIMEOUT_SEC
+                    ):
+                        pending_sell_since = None
+                        pending_sell_volume = 0
+
                     if real_volume == 0 and hold_t0_volume > 0:
                         state["positions"] = []
                         state["hold_layers"] = 0
@@ -347,7 +577,22 @@ def main():
                     if atr_info:
                         base_grid_step = atr_info['base_grid_step']
                         grid_step = base_grid_step + (hold_layers * LAYER_STEP_BONUS)
+                        # 双标共享池：占用 >90% 步长×1.5，<85% 解除（迟滞）
+                        pool_data = _load_shared_pool()
+                        committed = pool_data.get("committed", 0.0)
+                        global _step_penalty_active
+                        if committed > POOL_90_PCT:
+                            _step_penalty_active = True
+                        elif committed < POOL_85_PCT:
+                            _step_penalty_active = False
+                        if _step_penalty_active:
+                            grid_step *= 1.5
                         atr_info['grid_step'] = grid_step
+                        atr_info['pool_committed'] = committed
+                        atr_info['pool_penalty'] = _step_penalty_active
+                        atr_info['pool_used_159201'] = pool_data.get("used_159201", 0)
+                        atr_info['pool_acc_alpha_159201'] = pool_data.get("acc_alpha_159201", 0)
+                        atr_info['pool_acc_alpha_512890'] = pool_data.get("acc_alpha_512890", 0)
                         sell_threshold = atr_info['sell_threshold']
                         batch_factor = atr_info['batch_factor']
                         sell_eff = sell_threshold * SELL_THRESHOLD_FACTOR
@@ -366,39 +611,80 @@ def main():
 
                         # 仅当行情新鲜时才发出买卖信号，避免网络中断后误触发
                         if data_ok:
-                            # 卖出：先持久化状态再发信号，崩溃恢复后不会重复卖
-                            if positions:
-                                to_remove = []
-                                sell_shares_total = 0
-                                for idx, lot in enumerate(positions):
-                                    if curr_p >= lot["buy_price"] * (1 + sell_eff):
-                                        to_remove.append(idx)
-                                        sell_shares_total += lot["shares"]
-                                for idx in reversed(to_remove):
-                                    positions.pop(idx)
-                                if sell_shares_total > 0:
-                                    state["positions"] = positions
-                                    state["hold_layers"] = len(positions)
-                                    state["hold_t0_volume"] = sum(p["shares"] for p in positions)
-                                    state["total_cost"] = sum(p["cost"] for p in positions)
-                                    state["last_buy_price"] = curr_p
-                                    if not positions:
-                                        state["last_sell_timestamp"] = time.time()
-                                    _save_state(state)
-                                    execute_signal("SELL", curr_p, f"单笔止盈(涨幅≥{sell_eff*100:.2f}%)", shares=sell_shares_total)
+                            # 补单（单边下跌部分成交）：未消费信号时才发，价格回到补单价以下且 15 分钟内
+                            pending_shares = state.get("pending_buy_shares") or 0
+                            pending_price = state.get("pending_buy_price")
+                            pending_ts = state.get("pending_buy_since")
+                            if (pending_shares > 0 and pending_price is not None and pending_ts is not None
+                                and (time.time() - pending_ts) <= PENDING_BUY_TIMEOUT_SEC
+                                and curr_p <= pending_price and not os.path.exists(SIGNAL_FILE)):
+                                execute_signal(
+                                    "BUY", curr_p, "补单(部分成交回补)", shares=pending_shares, is_topup=True,
+                                    amount=round(pending_price * pending_shares, 2), layer_index=hold_layers,
+                                )
+                                state["pending_buy_shares"] = 0
+                                state["pending_buy_price"] = None
+                                state["pending_buy_since"] = None
+                                _save_state(state)
+                            else:
+                                # 卖出：先持久化状态再发信号，崩溃恢复后不会重复卖；静默期内若真实持仓未下降则不再发卖单
+                                if positions:
+                                    to_remove = []
+                                    sell_shares_total = 0
+                                    for idx, lot in enumerate(positions):
+                                        if curr_p >= lot["buy_price"] * (1 + sell_eff):
+                                            to_remove.append(idx)
+                                            sell_shares_total += lot["shares"]
+                                    if sell_shares_total > 0:
+                                        in_sell_cooldown = (
+                                            pending_sell_since is not None
+                                            and (time.time() - pending_sell_since) <= PENDING_TIMEOUT_SEC
+                                            and real_volume >= pending_sell_volume
+                                        )
+                                        if not in_sell_cooldown:
+                                            state["last_sent_sell_removed_lots"] = [
+                                                {"shares": positions[i]["shares"], "cost": positions[i]["cost"], "buy_price": positions[i]["buy_price"]}
+                                                for i in to_remove
+                                            ]
+                                            for idx in reversed(to_remove):
+                                                positions.pop(idx)
+                                            state["positions"] = positions
+                                            state["hold_layers"] = len(positions)
+                                            state["hold_t0_volume"] = sum(p["shares"] for p in positions)
+                                            state["total_cost"] = sum(p["cost"] for p in positions)
+                                            state["last_buy_price"] = curr_p
+                                            if not positions:
+                                                state["last_sell_timestamp"] = time.time()
+                                            _save_state(state)
+                                            execute_signal("SELL", curr_p, f"单笔止盈(涨幅≥{sell_eff*100:.2f}%)", shares=sell_shares_total)
+                                            pending_sell_since = time.time()
+                                            pending_sell_volume = hold_t0_volume
 
-                            # 买入：先持久化状态再发信号
-                            elif hold_layers < MAX_LAYERS and curr_p <= last_buy_price * (1 - grid_step * BUY_STEP_FACTOR) and not in_cooling and not pause_buy:
-                                money = PART_MONEY * batch_factor
-                                shares = int(money / curr_p // 100) * 100
-                                if shares > 0:
-                                    state["last_buy_price"] = curr_p
-                                    state["positions"] = positions + [{"shares": shares, "cost": shares * curr_p, "buy_price": curr_p}]
-                                    state["hold_layers"] = hold_layers + 1
-                                    state["hold_t0_volume"] = hold_t0_volume + shares
-                                    state["total_cost"] = total_cost + shares * curr_p
-                                    _save_state(state)
-                                    execute_signal("BUY", curr_p, f"ATR网格触发(步长{grid_step*100:.2f}%)", shares=shares)
+                                # 买入：静默期内若真实持仓未达到目标层数则不再发买单；双标时新开第一层需物理池剩余≥15%
+                                elif hold_layers < MAX_LAYERS and curr_p <= last_buy_price * (1 - grid_step * BUY_STEP_FACTOR) and not in_cooling and not pause_buy:
+                                    pool_block_first_layer = (hold_layers == 0 and committed > POOL_85_PCT)
+                                    in_buy_cooldown = (
+                                        pending_until_layers is not None
+                                        and (time.time() - (pending_since or 0)) <= PENDING_TIMEOUT_SEC
+                                        and real_layers < pending_until_layers
+                                    )
+                                    if not in_buy_cooldown and not pool_block_first_layer:
+                                        money = PART_MONEY * batch_factor
+                                        shares = int(money / curr_p // 100) * 100
+                                        if shares > 0:
+                                            state["last_sent_buy_prev_anchor"] = last_buy_price
+                                            state["last_buy_price"] = curr_p
+                                            state["positions"] = positions + [{"shares": shares, "cost": shares * curr_p, "buy_price": curr_p}]
+                                            state["hold_layers"] = hold_layers + 1
+                                            state["hold_t0_volume"] = hold_t0_volume + shares
+                                            state["total_cost"] = total_cost + shares * curr_p
+                                            _save_state(state)
+                                            execute_signal(
+                                                "BUY", curr_p, f"ATR网格触发(步长{grid_step*100:.2f}%)", shares=shares,
+                                                amount=round(money, 2), layer_index=hold_layers,
+                                            )
+                                            pending_until_layers = hold_layers + 1
+                                            pending_since = time.time()
 
                     header_msg = "💎 159201 自由现金流 ETF | ATR 动态网格 + 趋势自适应 | 实盘信号"
                     if atr_info and atr_info.get("data_stale"):
@@ -425,6 +711,7 @@ def main():
                 )
 
             time.sleep(1)
+
 
 if __name__ == "__main__":
     main()

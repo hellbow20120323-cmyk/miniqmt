@@ -8,7 +8,11 @@ venv/
 
 # 行情/回测数据（体积大）
 history_*.csv
+quote_*.csv
 sweep_results_*.csv
+
+# macOS
+.DS_Store
 
 # 运行时生成
 shared_quote.json

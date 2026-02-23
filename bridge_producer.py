@@ -6,11 +6,11 @@ from xtquant import xtdata
 from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
 
-# --- 配置区 ---
-STOCK_CODE = '603060.SH'
+# --- 配置区（与 mac_dashboard / order_executor 标的一致）---
+STOCK_CODE = '159201.SZ'
 ACCOUNT_ID = '8883921646'  # ⚠️ 请修改为你的实际账号
 ACCOUNT_TYPE = 'STOCK'      # 股票账户通常是 STOCK
-# Windows 侧对应的共享目录
+# Windows 侧对应的共享目录，与 dashboard/executor 共用
 SHARED_DIR = r'C:\Mac\Home\Documents\miniqmt'
 SHARED_FILE_PATH = os.path.join(SHARED_DIR, 'shared_quote.json')
 
