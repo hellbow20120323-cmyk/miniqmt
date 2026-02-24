@@ -30,10 +30,12 @@ QMT_USERDATA_PATH = r'C:\国金证券QMT交易端\userdata_mini'
 ACCOUNT_ID = '8883921646'
 ACCOUNT_TYPE = 'STOCK'
 # 双标的：159201 + 512890，参见 开发文档_双标的共享资金池.md
-ALLOWED_CODES = ['159201.SZ', '512890.SH']
+ALLOWED_CODES = ['159201.SZ']
 MAX_SHARES_PER_ORDER = 100000
 # 是否启用 GlobalVault 共享资金池审批（需 global_vault 模块）
 USE_GLOBAL_VAULT = True
+# 模拟下单：不连 QMT、不实际交易，仅校验+写 order_result+消费。设置环境变量 ORDER_EXECUTOR_SIMULATE=1 启用
+SIMULATE_MODE = os.environ.get('ORDER_EXECUTOR_SIMULATE', '').strip() in ('1', 'true', 'yes')
 CASH_BUFFER_RATIO = 1.01
 POLL_INTERVAL_SEC = 3
 SIGNAL_EXPIRE_SEC = 300
@@ -184,6 +186,15 @@ def run_once(trader, acc):
     amount = float(sig.get('amount') or 0) or round(price * shares, 2)
     layer_index = int(sig.get('layer_index', 0))
 
+    # 模拟模式：不连 QMT、不实际下单，仅校验+写 result+消费
+    if SIMULATE_MODE:
+        logger.info("[SIMULATE] 模拟下单: signal_id=%s code=%s %s %s @ %s (未实际交易)",
+                    signal_id, code, direction, shares, price)
+        save_executed_id(signal_id)
+        consume_signal_file(signal_id, True)
+        write_order_result(signal_id, 'success', order_id=0, message='模拟下单', direction=direction, requested_shares=shares, filled_shares=shares)
+        return
+
     vault = None
     if USE_GLOBAL_VAULT and GLOBAL_VAULT_AVAILABLE:
         try:
@@ -240,7 +251,13 @@ def run_once(trader, acc):
                 if direction == 'BUY':
                     vault.on_fill(code, client_order_id)
                 else:
-                    vault.release(code, client_order_id)
+                    release_ids = sig.get("release_client_order_ids")
+                    if release_ids and isinstance(release_ids, list):
+                        for rid in release_ids:
+                            if rid:
+                                vault.release(code, str(rid))
+                    else:
+                        vault.release(code, client_order_id)
             except Exception as e:
                 logger.warning("vault on_fill/release: %s", e)
         logger.info("order placed: signal_id=%s code=%s %s %s @ %s order_id=%s",
@@ -257,16 +274,20 @@ def run_once(trader, acc):
 
 
 def main():
-    logger.info("order_executor starting, SHARED_DIR=%s", SHARED_DIR)
-    session_id = random.randint(100000, 999999)
-    trader = XtQuantTrader(QMT_USERDATA_PATH, session_id)
-    trader.start()
-    res = trader.connect()
-    if res != 0:
-        logger.error("trader.connect failed: %s", res)
-        return
-    acc = StockAccount(ACCOUNT_ID, ACCOUNT_TYPE)
-    logger.info("connected, polling every %s sec", POLL_INTERVAL_SEC)
+    logger.info("order_executor starting, SHARED_DIR=%s, SIMULATE=%s", SHARED_DIR, SIMULATE_MODE)
+    trader, acc = None, None
+    if not SIMULATE_MODE:
+        session_id = random.randint(100000, 999999)
+        trader = XtQuantTrader(QMT_USERDATA_PATH, session_id)
+        trader.start()
+        res = trader.connect()
+        if res != 0:
+            logger.error("trader.connect failed: %s", res)
+            return
+        acc = StockAccount(ACCOUNT_ID, ACCOUNT_TYPE)
+        logger.info("connected, polling every %s sec", POLL_INTERVAL_SEC)
+    else:
+        logger.info("[SIMULATE] 模拟模式：不连 QMT，不实际交易，polling every %s sec", POLL_INTERVAL_SEC)
     while True:
         try:
             run_once(trader, acc)

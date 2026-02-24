@@ -15,9 +15,11 @@ sweep_results_*.csv
 .DS_Store
 
 # 运行时生成
-shared_quote.json
+shared_quote_159201.json
+shared_quote_512890.json
 order_signal.json
 dashboard_state.json
+dashboard_state_512890.json
 *.tmp
 backtest_*.png
 
