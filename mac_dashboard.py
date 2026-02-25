@@ -15,13 +15,15 @@ from rich.panel import Panel
 from rich.layout import Layout
 from rich.columns import Columns
 
+STOCK_CODE = "159201.SZ"
+
 # --- 路径：相对本脚本所在目录；离线测试时可设环境变量 DASHBOARD_WORK_DIR 指向 test_offline ---
 _SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
-SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, 'shared_quote_159201.json')  # 159201 自由现金流
-SHARED_POOL_FILE = os.path.join(_SCRIPT_DIR, 'shared_pool.json')  # 共享资金池，当前仅服务 159201，见 开发文档_双标的共享资金池.md
-SIGNAL_FILE = os.path.join(_SCRIPT_DIR, 'order_signal.json')
-ORDER_RESULT_FILE = os.path.join(_SCRIPT_DIR, 'order_result.json')
-STATE_FILE = os.path.join(_SCRIPT_DIR, 'dashboard_state.json')  # 159201（兼容旧版）
+SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
+STATE_FILE = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
+SHARED_POOL_FILE = os.path.join(_SCRIPT_DIR, "shared_pool.json")  # 共享资金池，当前仅服务 159201，见 开发文档_双标的共享资金池.md
+SIGNAL_FILE = os.path.join(_SCRIPT_DIR, "order_signal.json")
+ORDER_RESULT_FILE = os.path.join(_SCRIPT_DIR, "order_result.json")
 
 # 物理池与迟滞（与 global_vault / 开发文档一致）
 PHYSICAL_POOL = 300_000
@@ -31,9 +33,6 @@ _step_penalty_active = False
 
 # --- 部分成交：单边下跌补买 15 分钟超时，单边上涨只对齐不补卖 ---
 PENDING_BUY_TIMEOUT_SEC = 900
-
-# --- 标的 ---
-STOCK_CODE = '159201.SZ'
 
 # --- 与回测一致：30万固定｜20万流动，均权9层，统一止盈 0.5%×涨多1.4，动态冷静期，ATR 熔断 ---
 ATR_PERIOD = 14
@@ -46,6 +45,7 @@ BUY_STEP_FACTOR = 1.0
 TREND_MA_PERIOD = 60
 MAX_LAYERS = 9
 BATCH_MONEY = 200000             # 流动仓 20 万（固定仓 30 万仅回测/持仓用）
+COOLING_ENABLED = True           # 启用全平后的冷静期
 COOLING_BARS = 15                # 默认冷静期 15 分钟
 COOLING_BARS_SHORT = 5           # RSI<35 时缩短为 5 分钟
 RSI_COOLING_THRESHOLD = 35
@@ -692,7 +692,8 @@ def main():
                         cooling_minutes = COOLING_BARS_SHORT if rsi_now < RSI_COOLING_THRESHOLD else COOLING_BARS
                         last_sell_ts = state.get("last_sell_timestamp")
                         in_cooling = (
-                            hold_layers == 0
+                            COOLING_ENABLED
+                            and hold_layers == 0
                             and last_sell_ts is not None
                             and (time.time() - last_sell_ts) < cooling_minutes * 60
                         )
@@ -825,7 +826,7 @@ def main():
                         header_msg += " | ⚠️ 行情已过期，暂停发单"
                     layout["header"].update(Panel(header_msg, style="bold green"))
 
-                    # 159201 面板（含策略与交易）
+                    # 单标 159201 面板（含策略与交易）
                     table_159201 = generate_display(
                         data,
                         atr_info,
@@ -848,8 +849,9 @@ def main():
                 except Exception as e:
                     layout["header"].update(Panel(f"❌ 错误: {str(e)}", style="bold red"))
             else:
+                wait_msg = f"⏳ 等待 {os.path.basename(SHARED_FILE_159201)}… 请由桥接或本地写入行情"
                 layout["header"].update(
-                    Panel("⏳ 等待 shared_quote_159201.json… 请由桥接或本地写入行情", style="bold yellow")
+                    Panel(wait_msg, style="bold yellow")
                 )
 
             time.sleep(1)

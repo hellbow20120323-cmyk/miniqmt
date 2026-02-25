@@ -8,13 +8,12 @@
 
 运行: python reset_build_plan.py
 """
+import argparse
 import json
 import os
 from typing import Optional
 
 _SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(_SCRIPT_DIR, 'dashboard_state.json')
-SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, 'shared_quote_159201.json')
 
 
 def _fresh_state():
@@ -53,25 +52,44 @@ def _get_current_price(shared_file: str) -> Optional[float]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="重置建仓计划：清空策略状态，以当前价为新锚点开启新计划（支持多标的）。")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="159201",
+        help="标的代码（不含交易所后缀），如 159201 或 512890；默认 159201。",
+    )
+    args = parser.parse_args()
+    symbol = args.symbol.strip()
+
+    if symbol == "159201":
+        state_file = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
+        shared_file = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
+        label = "159201 自由现金流"
+    else:
+        state_file = os.path.join(_SCRIPT_DIR, f"dashboard_state_{symbol}.json")
+        shared_file = os.path.join(_SCRIPT_DIR, f"shared_quote_{symbol}.json")
+        label = f"{symbol} 网格策略"
+
     state = _fresh_state()
 
     # 可选：若存在行情，用当前价预填 last_buy_price，否则保持 None（dashboard 首次运行时会从 curr_p 初始化）
-    p159201 = _get_current_price(SHARED_FILE_159201)
-    if p159201 and p159201 > 0:
-        state["last_buy_price"] = p159201
-        print(f"159201 当前价: {p159201:.3f}，已设为新锚点")
+    p = _get_current_price(shared_file)
+    if p and p > 0:
+        state["last_buy_price"] = p
+        print(f"{symbol} 当前价: {p:.3f}，已设为新锚点")
     else:
-        print("159201: 无行情文件，last_buy_price 将待 dashboard 运行时从当前价初始化")
+        print(f"{symbol}: 无行情文件，last_buy_price 将待 dashboard 运行时从当前价初始化")
     try:
-        tmp = STATE_FILE + ".tmp"
+        tmp = state_file + ".tmp"
         with open(tmp, 'w') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
-        print(f"已重置: 159201 自由现金流 -> {STATE_FILE}")
+        os.replace(tmp, state_file)
+        print(f"已重置: {label} -> {state_file}")
     except Exception as e:
-        print(f"写入失败 {STATE_FILE}: {e}")
+        print(f"写入失败 {state_file}: {e}")
 
     print("\n新建仓计划已就绪。请重启 mac_dashboard.py。")
 

@@ -10,6 +10,7 @@
     python init_fixed_flow_plan.py
 """
 
+import argparse
 import json
 import os
 import sys
@@ -18,8 +19,6 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
-SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
 
 
 def _fresh_state() -> Dict[str, Any]:
@@ -142,19 +141,40 @@ def main() -> None:
         print("当前时间尚未到 15:00，请收盘后（建议 15:05 之后）再运行本脚本。")
         sys.exit(1)
 
-    print("=== 初始化固定 80% + 流动 20% 网格计划（159201 单标） ===")
-    print(f"工作目录: {_SCRIPT_DIR}")
+    parser = argparse.ArgumentParser(description="初始化固定 80% + 流动 20% 网格计划（支持多标的）。")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="159201",
+        help="标的代码（不含交易所后缀），如 159201 或 512890；默认 159201。",
+    )
+    args = parser.parse_args()
+    symbol = args.symbol.strip()
 
-    total_vol, today_close = _read_quote(SHARED_FILE_159201)
+    if symbol == "159201":
+        state_file = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
+        shared_file = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
+        label = "159201 自由现金流"
+    else:
+        state_file = os.path.join(_SCRIPT_DIR, f"dashboard_state_{symbol}.json")
+        shared_file = os.path.join(_SCRIPT_DIR, f"shared_quote_{symbol}.json")
+        label = f"{symbol} 网格策略"
+
+    print(f"=== 初始化固定 80% + 流动 20% 网格计划（{symbol}） ===")
+    print(f"工作目录: {_SCRIPT_DIR}")
+    print(f"状态文件: {state_file}")
+    print(f"行情文件: {shared_file}")
+
+    total_vol, today_close = _read_quote(shared_file)
     if today_close is None:
-        print("未能从 shared_quote_159201.json 读取到有效价格，放弃初始化。")
+        print(f"未能从 {os.path.basename(shared_file)} 读取到有效价格，放弃初始化。")
         sys.exit(1)
 
     fixed_vol, flow_vol = _split_fixed_flow(total_vol)
     print(f"当前真实持仓: {total_vol} 股 -> 固定仓: {fixed_vol} 股, 流动仓: {flow_vol} 股")
     print(f"流动仓基准价(今日收盘/当前价): {today_close:.3f}")
 
-    state = _load_state(STATE_FILE)
+    state = _load_state(state_file)
 
     # 固定仓设置
     state["fixed_volume"] = fixed_vol
@@ -202,16 +222,16 @@ def main() -> None:
     state["pending_sell_volume"] = 0
     state["last_sell_timestamp"] = None
 
-    tmp = STATE_FILE + ".tmp"
+    tmp = state_file + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
-        print(f"已写入状态文件: {STATE_FILE}")
+        os.replace(tmp, state_file)
+        print(f"已写入状态文件: {state_file}")
     except Exception as e:
-        print(f"写入状态文件失败 {STATE_FILE}: {e}")
+        print(f"写入状态文件失败 {state_file}: {e}")
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
