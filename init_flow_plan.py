@@ -10,7 +10,6 @@
     python init_flow_plan.py
 """
 
-import argparse
 import json
 import os
 import sys
@@ -19,6 +18,8 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
+SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
 
 
 def _fresh_state() -> Dict[str, Any]:
@@ -188,31 +189,10 @@ def main() -> None:
         print("当前时间尚未到 15:00，请收盘后（建议 15:05 之后）再运行本脚本。")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="初始化新建仓计划：沿用现有持仓、重置成本基准（支持多标的）。")
-    parser.add_argument(
-        "--symbol",
-        type=str,
-        default="159201",
-        help="标的代码（不含交易所后缀），如 159201 或 512890；默认 159201。",
-    )
-    args = parser.parse_args()
-    symbol = args.symbol.strip()
-
-    if symbol == "159201":
-        state_file = os.path.join(_SCRIPT_DIR, "dashboard_state.json")
-        shared_file = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
-        label = "159201 自由现金流"
-    else:
-        state_file = os.path.join(_SCRIPT_DIR, f"dashboard_state_{symbol}.json")
-        shared_file = os.path.join(_SCRIPT_DIR, f"shared_quote_{symbol}.json")
-        label = f"{symbol} 网格策略"
-
-    print(f"=== 初始化新建仓计划：沿用持仓、重置成本基准（{symbol}） ===")
+    print("=== 初始化新建仓计划：沿用持仓、重置成本基准（159201 单标） ===")
     print(f"工作目录: {_SCRIPT_DIR}")
-    print(f"状态文件: {state_file}")
-    print(f"行情文件: {shared_file}")
 
-    _apply_flow_plan(state_file, shared_file, label)
+    _apply_flow_plan(STATE_FILE, SHARED_FILE_159201, "159201 自由现金流")
 
     print("\n初始化完成。请重启 mac_dashboard.py，使新建仓计划生效。")
 
