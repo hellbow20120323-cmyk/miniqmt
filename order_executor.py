@@ -30,15 +30,16 @@ QMT_USERDATA_PATH = r'C:\国金证券QMT交易端\userdata_mini'
 ACCOUNT_ID = '8883921646'
 ACCOUNT_TYPE = 'STOCK'
 # 双标的：159201 + 512890，参见 开发文档_双标的共享资金池.md
-ALLOWED_CODES = ['159201.SZ']
+ALLOWED_CODES = ['159201.SZ', '512890.SH']
 MAX_SHARES_PER_ORDER = 100000
 # 是否启用 GlobalVault 共享资金池审批（需 global_vault 模块）
 USE_GLOBAL_VAULT = True
 # 模拟下单：不连 QMT、不实际交易，仅校验+写 order_result+消费。设置环境变量 ORDER_EXECUTOR_SIMULATE=1 启用
-SIMULATE_MODE = os.environ.get('ORDER_EXECUTOR_SIMULATE', '').strip() in ('1', 'true', 'yes')
+#SIMULATE_MODE = os.environ.get('ORDER_EXECUTOR_SIMULATE', '').strip() in ('1', 'true', 'yes')
+SIMULATE_MODE = 0
 CASH_BUFFER_RATIO = 1.01
 POLL_INTERVAL_SEC = 3
-SIGNAL_EXPIRE_SEC = 300
+SIGNAL_EXPIRE_SEC = 360
 MAX_EXECUTED_IDS = 5000
 
 logging.basicConfig(

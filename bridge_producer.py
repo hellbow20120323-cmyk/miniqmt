@@ -7,9 +7,10 @@ from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
 
 # --- 配置区（与 mac_dashboard / order_executor 标的一致）---
-# 单标的：159201 自由现金流
+# 双标的：159201 自由现金流 + 512890 红利低波
 CODES = [
     ('159201.SZ', 'shared_quote_159201.json'),  # 自由现金流
+    ('512890.SH', 'shared_quote_512890.json'),  # 红利低波
 ]
 ACCOUNT_ID = '8883921646'  # ⚠️ 请修改为你的实际账号
 ACCOUNT_TYPE = 'STOCK'      # 股票账户通常是 STOCK
@@ -21,6 +22,26 @@ SHARED_DIR = r'C:\Mac\Home\Documents\miniqmt'
 QMT_USERDATA_PATH = r'C:\国金证券QMT交易端\userdata_mini'
 
 def start():
+    # #region agent log
+    try:
+        _log = {
+            "sessionId": "ea09bf",
+            "runId": "pre-fix",
+            "hypothesisId": "H0",
+            "location": "bridge_producer.py:start",
+            "message": "bridge_start",
+            "data": {
+                "codes": [c[0] for c in CODES],
+                "shared_dir": SHARED_DIR,
+                "qmt_userdata_path": QMT_USERDATA_PATH,
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        with open("/Users/yuhao/Documents/miniqmt/.cursor/debug-ea09bf.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion agent log
     # 1. 初始化行情（双标的）
     codes = [c[0] for c in CODES]
     for code in codes:
@@ -39,7 +60,31 @@ def start():
 
     while True:
         tick_res = xtdata.get_full_tick(codes)
-        positions = trader.query_stock_positions(acc)
+        try:
+            positions = trader.query_stock_positions(acc)
+        except Exception:
+            positions = []
+
+        # #region agent log
+        try:
+            _log = {
+                "sessionId": "ea09bf",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "bridge_producer.py:loop",
+                "message": "tick_and_positions",
+                "data": {
+                    "tick_keys": list(tick_res.keys()) if isinstance(tick_res, dict) else str(type(tick_res)),
+                    "has_159201": "159201.SZ" in tick_res if isinstance(tick_res, dict) else False,
+                    "has_512890": "512890.SH" in tick_res if isinstance(tick_res, dict) else False,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            with open("/Users/yuhao/Documents/miniqmt/.cursor/debug-ea09bf.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # #endregion agent log
 
         for STOCK_CODE, filename in CODES:
             current_pos = {}
@@ -77,8 +122,50 @@ def start():
                 try:
                     with open(filepath, 'w', encoding='utf-8') as f:
                         json.dump(payload, f)
+
+                    # #region agent log
+                    try:
+                        _log = {
+                            "sessionId": "ea09bf",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H2",
+                            "location": "bridge_producer.py:write",
+                            "message": "write_shared_quote_ok",
+                            "data": {
+                                "code": STOCK_CODE,
+                                "filepath": filepath,
+                                "price": payload.get("price"),
+                                "time": payload.get("time"),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                        with open("/Users/yuhao/Documents/miniqmt/.cursor/debug-ea09bf.log", "a", encoding="utf-8") as _f:
+                            _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion agent log
                 except Exception as e:
                     print(f"写入 {filename} 出错: {e}")
+                    # #region agent log
+                    try:
+                        _log = {
+                            "sessionId": "ea09bf",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H3",
+                            "location": "bridge_producer.py:write",
+                            "message": "write_shared_quote_error",
+                            "data": {
+                                "code": STOCK_CODE,
+                                "filepath": filepath,
+                                "error": str(e),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                        with open("/Users/yuhao/Documents/miniqmt/.cursor/debug-ea09bf.log", "a", encoding="utf-8") as _f:
+                            _f.write(json.dumps(_log, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion agent log
 
         time.sleep(4)
 

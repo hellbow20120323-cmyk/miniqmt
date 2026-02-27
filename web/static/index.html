@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>miniqmt 数据与历史</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header class="header">
+    <h1>miniqmt 数据与历史</h1>
+    <nav class="tabs">
+      <button type="button" class="tab active" data-tab="overview">当前数据</button>
+      <button type="button" class="tab" data-tab="history">历史数据</button>
+    </nav>
+  </header>
+
+  <main class="main">
+    <section id="panel-overview" class="panel active">
+      <div id="overview-loading" class="loading">加载中…</div>
+      <div id="overview-content" class="overview-content" hidden>
+        <div class="symbols-row">
+          <div id="card-159201" class="card symbol-card"></div>
+          <div id="card-512890" class="card symbol-card"></div>
+        </div>
+        <div class="card pool-card">
+          <h3>共享资金池</h3>
+          <div id="pool-content"></div>
+        </div>
+        <div class="card signal-card">
+          <h3>最新信号与结果</h3>
+          <div id="signal-content"></div>
+        </div>
+      </div>
+      <div id="overview-error" class="error" hidden></div>
+    </section>
+
+    <section id="panel-history" class="panel" hidden>
+      <div class="history-section">
+        <h2>K 线</h2>
+        <div class="kline-tabs">
+          <button type="button" class="kline-tab active" data-symbol="159201">159201 自由现金流</button>
+          <button type="button" class="kline-tab" data-symbol="512890">512890 红利低波</button>
+        </div>
+        <div id="kline-container" class="chart-container"></div>
+      </div>
+      <div class="history-section">
+        <h2>历史信号</h2>
+        <div class="filter-row">
+          <label>标的</label>
+          <select id="signal-symbol-filter">
+            <option value="">全部</option>
+            <option value="159201">159201</option>
+            <option value="512890">512890</option>
+          </select>
+        </div>
+        <div id="signals-loading" class="loading">加载中…</div>
+        <div class="table-wrap">
+          <table id="signals-table" class="data-table" hidden>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>标的</th>
+                <th>方向</th>
+                <th>价格</th>
+                <th>数量</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="signals-error" class="error" hidden></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

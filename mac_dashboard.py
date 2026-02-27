@@ -17,23 +17,9 @@ from rich.columns import Columns
 
 # --- 路径：相对本脚本所在目录；离线测试时可设环境变量 DASHBOARD_WORK_DIR 指向 test_offline ---
 _SCRIPT_DIR = os.environ.get("DASHBOARD_WORK_DIR") or os.path.dirname(os.path.abspath(__file__))
-SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, 'shared_quote_159201.json')  # 159201 自由现金流
-SHARED_POOL_FILE = os.path.join(_SCRIPT_DIR, 'shared_pool.json')  # 共享资金池，当前仅服务 159201，见 开发文档_双标的共享资金池.md
-SIGNAL_FILE = os.path.join(_SCRIPT_DIR, 'order_signal.json')
-ORDER_RESULT_FILE = os.path.join(_SCRIPT_DIR, 'order_result.json')
-STATE_FILE = os.path.join(_SCRIPT_DIR, 'dashboard_state.json')  # 159201（兼容旧版）
-
-# 物理池与迟滞（与 global_vault / 开发文档一致）
-PHYSICAL_POOL = 300_000
-POOL_90_PCT = 270_000   # 占用 > 90% 触发步长惩罚
-POOL_85_PCT = 255_000   # 占用 < 85% 解除惩罚；>85% 禁止新开第一层
-_step_penalty_active = False
-
-# --- 部分成交：单边下跌补买 15 分钟超时，单边上涨只对齐不补卖 ---
-PENDING_BUY_TIMEOUT_SEC = 900
-
-# --- 标的 ---
-STOCK_CODE = '159201.SZ'
+SHARED_POOL_FILE = os.path.join(_SCRIPT_DIR, "shared_pool.json")  # 共享资金池，当前仅服务 159201，见 开发文档_双标的共享资金池.md
+SIGNAL_FILE = os.path.join(_SCRIPT_DIR, "order_signal.json")
+ORDER_RESULT_FILE = os.path.join(_SCRIPT_DIR, "order_result.json")
 
 # --- 与回测一致：30万固定｜20万流动，均权9层，统一止盈 0.5%×涨多1.4，动态冷静期，ATR 熔断 ---
 ATR_PERIOD = 14
@@ -61,6 +47,28 @@ DOWNTREND_SELL_FACTOR = 0.83
 DOWNTREND_BATCH_FACTOR = 1.2
 
 PART_MONEY = BATCH_MONEY / MAX_LAYERS
+
+# --- 多标支持：按环境变量 DASHBOARD_SYMBOL 选择标的和状态文件 ---
+_DASHBOARD_SYMBOL = os.environ.get("DASHBOARD_SYMBOL") or "159201"
+if _DASHBOARD_SYMBOL == "512890":
+    STOCK_CODE = "512890.SH"
+    SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, "shared_quote_512890.json")
+    STATE_FILE = os.path.join(_SCRIPT_DIR, "dashboard_state_512890.json")
+    STRATEGY_NAME = "512890 红利低波"
+else:
+    STOCK_CODE = "159201.SZ"
+    SHARED_FILE_159201 = os.path.join(_SCRIPT_DIR, "shared_quote_159201.json")
+    STATE_FILE = os.path.join(_SCRIPT_DIR, "dashboard_state.json")  # 159201（兼容旧版）
+    STRATEGY_NAME = "159201 自由现金流"
+
+# --- 物理池与迟滞（与 global_vault / 开发文档一致） ---
+PHYSICAL_POOL = 300_000
+POOL_90_PCT = 270_000   # 占用 > 90% 触发步长惩罚
+POOL_85_PCT = 255_000   # 占用 < 85% 解除惩罚；>85% 禁止新开第一层
+_step_penalty_active = False
+
+# --- 部分成交：单边下跌补买 15 分钟超时，单边上涨只对齐不补卖 ---
+PENDING_BUY_TIMEOUT_SEC = 900
 
 # --- 容错与恢复：数据过期不交易、状态先于信号持久化、原子写入、与真实持仓同步 ---
 DATA_STALE_SECONDS = 300          # 行情超过 5 分钟未更新则不再发出新信号（网络/桥中断时避免误判）
@@ -722,55 +730,96 @@ def main():
                                 # 卖出：先持久化状态再发信号，崩溃恢复后不会重复卖；静默期内若真实持仓未下降则不再发卖单
                                 # 固定仓保护：真实持仓不得因网格卖出低于 fixed_volume
                                 if positions:
-                                    to_remove = []
-                                    sell_shares_total = 0
+                                    # 找出达到单笔止盈条件的层
+                                    candidate_indices = []
                                     for idx, lot in enumerate(positions):
                                         if curr_p >= lot["buy_price"] * (1 + sell_eff):
-                                            to_remove.append(idx)
-                                            sell_shares_total += lot["shares"]
-                                    if sell_shares_total > 0:
-                                        # 固定仓约束
+                                            candidate_indices.append(idx)
+                                    if candidate_indices:
+                                        # 固定仓约束：真实持仓不得因网格卖出低于 fixed_volume
                                         fixed_vol = int(state.get("fixed_volume") or 0)
                                         max_sell = max(0, real_volume - fixed_vol)
-                                        if max_sell <= 0:
-                                            # 已经在或低于固定仓，不再卖出
-                                            pass
-                                        else:
-                                            if sell_shares_total > max_sell:
-                                                # 仅卖出部分满足条件的层，使卖出总量不超过 max_sell，且不拆分单笔层
-                                                new_to_remove = []
-                                                acc = 0
-                                                for idx in to_remove:
-                                                    sh = positions[idx]["shares"]
-                                                    if acc + sh <= max_sell:
-                                                        new_to_remove.append(idx)
-                                                        acc += sh
-                                                    else:
-                                                        break
-                                                to_remove = new_to_remove
-                                                sell_shares_total = acc
-                                            if sell_shares_total > 0:
+                                        if max_sell > 0:
+                                            # 512890：优先处理最新一层（索引大的在后），并在受限时允许“先卖一点”
+                                            # 其他标的保持原有从前到后顺序与整层卖出逻辑
+                                            if STOCK_CODE.startswith("512890"):
+                                                sell_order = list(reversed(candidate_indices))
+                                            else:
+                                                sell_order = list(candidate_indices)
+
+                                            to_remove = []
+                                            full_sell_total = 0
+                                            for idx in sell_order:
+                                                sh = positions[idx]["shares"]
+                                                if full_sell_total + sh <= max_sell:
+                                                    to_remove.append(idx)
+                                                    full_sell_total += sh
+
+                                            sell_mode = "none"
+                                            sell_shares_total = 0
+                                            partial_info = None
+
+                                            if full_sell_total > 0:
+                                                # 正常整层卖出
+                                                sell_mode = "full"
+                                                sell_shares_total = full_sell_total
+                                            elif STOCK_CODE.startswith("512890"):
+                                                # 对 512890：若整层都过大导致一层也卖不了，则从最新一层部分减仓
+                                                # 只在 max_sell 足够 1 手时启用
+                                                max_lots = int(max_sell // 100) * 100
+                                                if max_lots >= 100:
+                                                    idx = sell_order[0]
+                                                    lot = positions[idx]
+                                                    partial_shares = min(max_lots, lot["shares"])
+                                                    if partial_shares >= 100:
+                                                        ratio = partial_shares / lot["shares"]
+                                                        partial_cost = lot["cost"] * ratio
+                                                        partial_info = (idx, partial_shares, partial_cost, lot)
+                                                        sell_mode = "partial"
+                                                        sell_shares_total = partial_shares
+
+                                            if sell_mode != "none" and sell_shares_total > 0:
                                                 in_sell_cooldown = (
                                                     pending_sell_since is not None
                                                     and (time.time() - pending_sell_since) <= PENDING_TIMEOUT_SEC
                                                     and real_volume >= pending_sell_volume
                                                 )
                                                 if not in_sell_cooldown:
-                                                    removed_lots = [
-                                                        {
-                                                            "shares": positions[i]["shares"],
-                                                            "cost": positions[i]["cost"],
-                                                            "buy_price": positions[i]["buy_price"],
-                                                            "client_order_id": positions[i].get("client_order_id"),
-                                                        }
-                                                        for i in to_remove
-                                                    ]
+                                                    removed_lots = []
+                                                    release_ids = []
+                                                    if sell_mode == "full":
+                                                        removed_lots = [
+                                                            {
+                                                                "shares": positions[i]["shares"],
+                                                                "cost": positions[i]["cost"],
+                                                                "buy_price": positions[i]["buy_price"],
+                                                                "client_order_id": positions[i].get("client_order_id"),
+                                                            }
+                                                            for i in to_remove
+                                                        ]
+                                                        release_ids = [
+                                                            lot["client_order_id"]
+                                                            for lot in removed_lots
+                                                            if lot.get("client_order_id")
+                                                        ]
+                                                        for idx in reversed(to_remove):
+                                                            positions.pop(idx)
+                                                    elif sell_mode == "partial" and partial_info is not None:
+                                                        idx, partial_shares, partial_cost, lot_snapshot = partial_info
+                                                        # 从最新一层部分减仓，但保留剩余仓位
+                                                        positions[idx]["shares"] -= partial_shares
+                                                        positions[idx]["cost"] -= partial_cost
+                                                        removed_lots = [
+                                                            {
+                                                                "shares": partial_shares,
+                                                                "cost": partial_cost,
+                                                                "buy_price": lot_snapshot["buy_price"],
+                                                                "client_order_id": lot_snapshot.get("client_order_id"),
+                                                            }
+                                                        ]
+                                                        # 部分减仓不释放 client_order_id，避免错误复用
+
                                                     state["last_sent_sell_removed_lots"] = removed_lots
-                                                    release_ids = [
-                                                        lot["client_order_id"] for lot in removed_lots if lot.get("client_order_id")
-                                                    ]
-                                                    for idx in reversed(to_remove):
-                                                        positions.pop(idx)
                                                     state["positions"] = positions
                                                     state["hold_layers"] = len(positions)
                                                     state["hold_t0_volume"] = sum(p["shares"] for p in positions)
@@ -791,9 +840,14 @@ def main():
                                                     )
                                                     pending_sell_since = time.time()
                                                     pending_sell_volume = hold_t0_volume
+                                                    # 同轮内更新本地变量，供下方买入判断使用
+                                                    hold_layers = len(positions)
+                                                    hold_t0_volume = sum(p["shares"] for p in positions)
+                                                    total_cost = sum(p["cost"] for p in positions)
+                                                    last_buy_price = state.get("last_buy_price", last_buy_price)
 
-                                # 买入：静默期内若真实持仓未达到目标层数则不再发买单；双标时新开第一层需物理池剩余≥15%
-                                elif hold_layers < MAX_LAYERS and curr_p <= last_buy_price * (1 - grid_step * BUY_STEP_FACTOR) and not in_cooling and not pause_buy:
+                                # 买入：与卖出独立判断；有仓时也可在价格跌到买点且未满层时加仓
+                                if hold_layers < MAX_LAYERS and curr_p <= last_buy_price * (1 - grid_step * BUY_STEP_FACTOR) and not in_cooling and not pause_buy:
                                     pool_block_first_layer = (hold_layers == 0 and committed > POOL_85_PCT)
                                     in_buy_cooldown = (
                                         pending_until_layers is not None
@@ -820,12 +874,12 @@ def main():
                                             pending_until_layers = hold_layers + 1
                                             pending_since = time.time()
 
-                    header_msg = "💎 159201 自由现金流 | ATR 动态网格 + 趋势自适应 | 实盘信号"
+                    header_msg = f"💎 {STRATEGY_NAME} | ATR 动态网格 + 趋势自适应 | 实盘信号"
                     if atr_info and atr_info.get("data_stale"):
                         header_msg += " | ⚠️ 行情已过期，暂停发单"
                     layout["header"].update(Panel(header_msg, style="bold green"))
 
-                    # 159201 面板（含策略与交易）
+                    # 单标面板（含策略与交易）
                     table_159201 = generate_display(
                         data,
                         atr_info,
@@ -838,9 +892,7 @@ def main():
                         part_money=PART_MONEY,
                         fixed_volume=state.get("fixed_volume", 0),
                     )
-                    layout["main_row"].update(
-                        Panel(table_159201, title="159201 自由现金流", border_style="cyan")
-                    )
+                    layout["main_row"].update(Panel(table_159201, title=STRATEGY_NAME, border_style="cyan"))
                     layout["footer"].update(
                         Panel("\n".join(state["signals"]) or "暂无信号", title="📜 最近信号", border_style="yellow")
                     )
